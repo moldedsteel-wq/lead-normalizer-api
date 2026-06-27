@@ -1,0 +1,13 @@
+{
+  "name": "lead-normalizer-api",
+  "version": "1.0.0",
+  "description": "",
+  "main": "normalize.js",
+  "scripts": {
+    "start": "node normalize.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}
