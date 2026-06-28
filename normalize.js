@@ -4,12 +4,11 @@ const path = require('path');
 const crypto = require('crypto');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
-// Strict Max Payload Size Limit: 50 Kilobytes to prevent memory flood vectors
+/// Strict Max Payload Size Limit: 50 Kilobytes to prevent memory flood vectors
 const MAX_PAYLOAD_SIZE = 50 * 1024;
 const KEYS_DIR = path.join(__dirname, 'workspace', 'active_keys');
 
 // Ensure complete directory structure exists on the server disk array at runtime
-const fs = require('fs');
 ['active_keys', 'client_index', 'project_leads', 'raw_submissions'].forEach(folder => {
     const dir = path.join(__dirname, 'workspace', folder);
     if (!fs.existsSync(dir)) {
