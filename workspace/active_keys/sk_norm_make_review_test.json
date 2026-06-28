@@ -1,0 +1,8 @@
+{
+  "customerEmail": "apps-review@make.com",
+  "customerId": "cus_manual_review_admin",
+  "subscriptionId": "sub_manual_review_admin",
+  "status": "active",
+  "limit": 1000,
+  "createdAt": "2026-06-28T00:00:00.000Z"
+}
