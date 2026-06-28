@@ -1,7 +1,13 @@
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // Strict Max Payload Size Limit: 50 Kilobytes to prevent memory flood vectors
 const MAX_PAYLOAD_SIZE = 50 * 1024;
+const KEYS_DIR = path.join(__dirname, 'workspace', 'active_keys');
+const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
 // Flexible Multi-Industry Schema Layout
 const createCanonicalLead = () => ({
@@ -94,41 +100,113 @@ function processIncomingWebhook(rawPayload) {
     return target;
 }
 
-// Server Lifecycle Engine
-const PORT = process.env.PORT || 3000;
-
 // Flat, in-memory usage storage tracking total requests per API key
 const apiKeyUsageCounters = {};
 
-// Helper: Extracts key limits from AUTHORIZED_KEYS (Format: "keyA:1000,keyB:5000")
-function getApiKeyLimit(incomingKey) {
-    const systemKeysString = process.env.AUTHORIZED_KEYS || "";
-    const pairs = systemKeysString.split(',').map(p => p.trim());
-    
-    for (const pair of pairs) {
-        const [key, limitStr] = pair.split(':');
-        if (key === incomingKey) {
-            return limitStr ? parseInt(limitStr, 10) : Infinity;
-        }
-    }
-    return null; // Key not found in system configuration
+// Map Stripe Line Item amounts to tier allocations
+function getLimitFromAmount(amountTotal) {
+    if (amountTotal === 2999) return 1000;
+    if (amountTotal === 7999) return 5000;
+    if (amountTotal === 19999) return 20000;
+    return 0;
 }
+
+// Reads dynamic usage metrics directly from disk
+function getApiKeyLimit(incomingKey) {
+    const cleanKey = incomingKey.replace(/[^a-zA-Z0-9_]/g, '');
+    const keyPath = path.join(KEYS_DIR, `${cleanKey}.json`);
+    
+    if (!fs.existsSync(keyPath)) {
+        return null;
+    }
+    
+    try {
+        const fileContent = fs.readFileSync(keyPath, 'utf8');
+        const keyData = JSON.parse(fileContent);
+        if (keyData.status !== 'active') return 0;
+        return keyData.limit || 0;
+    } catch (e) {
+        return null;
+    }
+}
+
+// Server Lifecycle Engine
+const PORT = process.env.PORT || 3000;
+
 const server = http.createServer((req, res) => {
-    // 1. Core Authentication & Tier Limit Verification
-    const incomingKey = req.headers['x-api-key'];
-    const allowedLimit = incomingKey ? getApiKeyLimit(incomingKey) : null;
+    // A. STRIPE WEBHOOK LISTENER ENDPOINT (Exempt from API key headers & uses raw buffers)
+    if (req.url === '/webhook' && req.method === 'POST') {
+        let chunks = [];
+        req.on('data', chunk => {
+            chunks.push(chunk);
+            if (Buffer.concat(chunks).length > MAX_PAYLOAD_SIZE) {
+                req.destroy();
+            }
+        });
+        
+        req.on('end', async () => {
+            const buf = Buffer.concat(chunks);
+            const sig = req.headers['stripe-signature'];
+
+            let event;
+            try {
+                event = stripe.webhooks.constructEvent(buf, sig, WEBHOOK_SECRET);
+            } catch (err) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: `Webhook Error: ${err.message}` }));
+            }
+
+            if (event.type === 'checkout.session.completed') {
+                const session = event.data.object;
+                
+                // Retrieve line items to calculate accurate subscription limitations
+                let limit = 0;
+                try {
+                    const lineItems = await stripe.checkout.sessions.listLineItems(session.id);
+                    if (lineItems.data && lineItems.data.length > 0) {
+                        limit = getLimitFromAmount(lineItems.data[0].amount_total);
+                    }
+                } catch (err) {
+                    console.error('Failed to retrieve line item details:', err);
+                }
+
+                const apiKey = `sk_norm_${crypto.randomBytes(16).toString('hex')}`;
+                const keyData = {
+                    customerEmail: session.customer_details.email,
+                    customerId: session.customer,
+                    subscriptionId: session.subscription,
+                    status: 'active',
+                    limit: limit,
+                    createdAt: new Date().toISOString()
+                };
+
+                fs.writeFileSync(
+                    path.join(KEYS_DIR, `${apiKey}.json`), 
+                    JSON.stringify(keyData, null, 2)
+                );
+                
+                console.log(`Generated active API key ${apiKey} with limit ${limit} for ${keyData.customerEmail}`);
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ received: true }));
+        });
+        return;
+    }
+
+    // B. AUTHENTICATED RUNTIME ROUTES
+    const incomingKey = req.headers['x-api-key'] || "";
+    const allowedLimit = getApiKeyLimit(incomingKey);
 
     if (allowedLimit === null) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ success: false, error: "Unauthorized: Invalid or missing X-API-Key" }));
     }
 
-    // Initialize counter if this is the key's first request
     if (!apiKeyUsageCounters[incomingKey]) {
         apiKeyUsageCounters[incomingKey] = 0;
     }
 
-    // Check if the user has breached their paid monthly request allocation
     if (apiKeyUsageCounters[incomingKey] >= allowedLimit) {
         res.writeHead(429, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ 
@@ -137,17 +215,14 @@ const server = http.createServer((req, res) => {
         }));
     }
 
-    // Increment usage counter for valid requests
-    apiKeyUsageCounters[incomingKey]++;
-
-    // 2. Connection Validation Route (Used by Make.com to verify key upon setup)
     if (req.method === 'POST' && req.url === '/v1/validate') {
+        apiKeyUsageCounters[incomingKey]++;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ success: true, status: "Connected successfully" }));
     }
 
-    // 3. Main Data Processing Route
     if (req.method === 'POST' && req.url === '/v1/normalize') {
+        apiKeyUsageCounters[incomingKey]++;
         let body = '';
         
         req.on('data', chunk => { 
