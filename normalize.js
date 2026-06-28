@@ -96,16 +96,49 @@ function processIncomingWebhook(rawPayload) {
 
 // Server Lifecycle Engine
 const PORT = process.env.PORT || 3000;
-const server = http.createServer((req, res) => {
-    // 1. Core Authentication Verification
-    const incomingKey = req.headers['x-api-key'];
-    const systemKeysString = process.env.AUTHORIZED_KEYS || "";
-    const authorizedKeys = systemKeysString.split(',').map(k => k.trim());
 
-    if (!incomingKey || !authorizedKeys.includes(incomingKey)) {
+// Flat, in-memory usage storage tracking total requests per API key
+const apiKeyUsageCounters = {};
+
+// Helper: Extracts key limits from AUTHORIZED_KEYS (Format: "keyA:1000,keyB:5000")
+function getApiKeyLimit(incomingKey) {
+    const systemKeysString = process.env.AUTHORIZED_KEYS || "";
+    const pairs = systemKeysString.split(',').map(p => p.trim());
+    
+    for (const pair of pairs) {
+        const [key, limitStr] = pair.split(':');
+        if (key === incomingKey) {
+            return limitStr ? parseInt(limitStr, 10) : Infinity;
+        }
+    }
+    return null; // Key not found in system configuration
+}
+const server = http.createServer((req, res) => {
+    // 1. Core Authentication & Tier Limit Verification
+    const incomingKey = req.headers['x-api-key'];
+    const allowedLimit = incomingKey ? getApiKeyLimit(incomingKey) : null;
+
+    if (allowedLimit === null) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ success: false, error: "Unauthorized: Invalid or missing X-API-Key" }));
     }
+
+    // Initialize counter if this is the key's first request
+    if (!apiKeyUsageCounters[incomingKey]) {
+        apiKeyUsageCounters[incomingKey] = 0;
+    }
+
+    // Check if the user has breached their paid monthly request allocation
+    if (apiKeyUsageCounters[incomingKey] >= allowedLimit) {
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ 
+            success: false, 
+            error: "Payment tier quota exceeded. Please upgrade your subscription plan." 
+        }));
+    }
+
+    // Increment usage counter for valid requests
+    apiKeyUsageCounters[incomingKey]++;
 
     // 2. Connection Validation Route (Used by Make.com to verify key upon setup)
     if (req.method === 'POST' && req.url === '/v1/validate') {
